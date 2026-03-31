@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="pl">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="Tablica odjazdów ZDiTM dla przystanków Starkiewicza, Brama Portowa i Plac Kościuszki."
+    >
+    <title>ZDiTM | Odjazdy</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="board" id="board">
+        <header class="topbar">
+          <div class="clock" id="clock">--:--:--</div>
+        </header>
+
+        <section class="stops-grid" id="stops-grid" aria-live="polite"></section>
+      </section>
+    </main>
+
+    <template id="section-template">
+      <section class="stop-section">
+        <header class="stop-section__header">
+          <h2 class="stop-section__title"></h2>
+        </header>
+        <div class="stop-section__rows"></div>
+      </section>
+    </template>
+
+    <template id="row-template">
+      <article class="departure-row">
+        <span class="departure-row__line"></span>
+        <p class="departure-row__direction"></p>
+        <strong class="departure-row__time"></strong>
+      </article>
+    </template>
+
+    <script src="./app.js" defer></script>
+  </body>
+</html>
