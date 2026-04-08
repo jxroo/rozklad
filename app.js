@@ -1,21 +1,22 @@
-const STOPS_API_URL = "https://www.zditm.szczecin.pl/api/v1/stops";
-const DISPLAY_API_BASE_URL = "https://www.zditm.szczecin.pl/api/v1/displays/";
-const TARGET_STOP_NAMES = ["Starkiewicza", "Brama Portowa", "Plac Kosciuszki"];
-const GROUP_ORDER = ["Starkiewicza", "Brama Portowa", "Plac Kościuszki"];
+const GROUP_ORDER = ["Starkiewicza", "Osiedle Polonia", "Dunikowskiego", "Plac Szyrockiego"];
+const BOARD_API_URL = "/api/board";
+const BOARD_CACHE_KEY = "zditm-board-cache-v1";
 const MAX_ROWS_PER_GROUP = 10;
-const REFRESH_INTERVAL_MS = 30_000;
+const FRONTEND_REFRESH_INTERVAL_MS = 15_000;
+const WATCHDOG_TIMEOUT_MS = 180_000;
+const HARD_RELOAD_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const FETCH_TIMEOUT_MS = 4_500;
 
 const state = {
-  stopGroups: [],
-  platforms: new Map(),
-  isRefreshing: false,
-  retryAt: null,
-  abortController: null,
-  refreshTimerId: null,
-  tickTimerId: null,
+  currentBoard: null,
+  lastSuccessAt: null,
+  pollTimerId: null,
+  watchdogTimerId: null,
+  hardReloadTimerId: null,
 };
 
 const elements = {
+  board: document.getElementById("board"),
   clock: document.getElementById("clock"),
   stopsGrid: document.getElementById("stops-grid"),
   sectionTemplate: document.getElementById("section-template"),
@@ -24,191 +25,75 @@ const elements = {
 
 document.addEventListener("DOMContentLoaded", () => {
   startClock();
+  installFrontendGuards();
+  registerServiceWorker();
   void bootstrap();
 });
 
 async function bootstrap() {
-  try {
-    await resolveStops();
-    seedPlatformState();
+  const cachedBoard = loadCachedBoard();
+
+  if (cachedBoard) {
+    state.currentBoard = cachedBoard;
+    renderBoard(cachedBoard);
+  } else {
     renderBoard();
-    await refreshDisplays();
-  } catch {
-    renderBoard(true);
   }
+
+  await refreshBoard();
+  scheduleBoardRefresh(FRONTEND_REFRESH_INTERVAL_MS);
+  scheduleHardReload();
 }
 
-async function resolveStops() {
-  const response = await fetch(STOPS_API_URL, { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`Lista przystanków odpowiedziała ${response.status}.`);
-  }
+async function refreshBoard() {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-  const payload = await response.json();
-  const groupedMap = new Map();
-
-  for (const stopName of GROUP_ORDER) {
-    groupedMap.set(stopName, []);
-  }
-
-  for (const item of payload.data ?? []) {
-    const normalizedName = normalizeStopName(item.name);
-    const targetName = TARGET_STOP_NAMES.find((name) => name === normalizedName);
-    if (!targetName) {
-      continue;
-    }
-
-    const displayName = denormalizeStopName(targetName);
-    groupedMap.get(displayName).push({
-      number: String(item.number),
-      name: displayName,
+  try {
+    const response = await fetch(BOARD_API_URL, {
+      cache: "no-store",
+      signal: controller.signal,
     });
-  }
 
-  state.stopGroups = GROUP_ORDER.map((groupName) => ({
-    name: groupName,
-    stops: (groupedMap.get(groupName) ?? []).sort((left, right) => Number(left.number) - Number(right.number)),
-  }));
-}
+    if (!response.ok) {
+      throw new Error(`Local API returned ${response.status}.`);
+    }
 
-function seedPlatformState() {
-  state.platforms = new Map();
+    const payload = await response.json();
+    validateBoardPayload(payload);
 
-  for (const group of state.stopGroups) {
-    for (const stop of group.stops) {
-      state.platforms.set(stop.number, {
-        departures: [],
-        updatedAt: null,
+    state.currentBoard = payload;
+    state.lastSuccessAt = Date.now();
+    saveCachedBoard(payload);
+    renderBoard(payload);
+  } catch {
+    const fallbackBoard = state.currentBoard ?? loadCachedBoard();
+    if (fallbackBoard) {
+      renderBoard({
+        ...fallbackBoard,
+        stale: true,
       });
+    } else {
+      renderBoard();
     }
+  } finally {
+    window.clearTimeout(timeoutId);
   }
 }
 
-async function refreshDisplays() {
-  if (state.isRefreshing || !state.stopGroups.length) {
-    return;
-  }
+function renderBoard(boardPayload = null) {
+  const payload = boardPayload ?? buildFallbackBoard();
+  const groups = Array.isArray(payload.groups) ? payload.groups : buildFallbackBoard().groups;
 
-  const now = Date.now();
-  if (state.retryAt && now < state.retryAt) {
-    scheduleNextRefresh(state.retryAt - now);
-    return;
-  }
-
-  state.isRefreshing = true;
-  state.abortController?.abort();
-  state.abortController = new AbortController();
-
-  const stops = state.stopGroups.flatMap((group) => group.stops);
-  const responses = await Promise.allSettled(
-    stops.map((stop) => fetchDisplay(stop, state.abortController.signal))
-  );
-
-  let nextRetryAt = null;
-
-  for (let index = 0; index < responses.length; index += 1) {
-    const stop = stops[index];
-    const previous = state.platforms.get(stop.number) ?? { departures: [], updatedAt: null };
-    const result = responses[index];
-
-    if (result.status === "fulfilled") {
-      if (result.value.retryAfterMs) {
-        nextRetryAt = Math.max(nextRetryAt ?? 0, Date.now() + result.value.retryAfterMs);
-        state.platforms.set(stop.number, previous);
-      } else {
-        state.platforms.set(stop.number, result.value.platform);
-      }
-      continue;
-    }
-
-    state.platforms.set(stop.number, previous);
-  }
-
-  state.isRefreshing = false;
-  state.retryAt = nextRetryAt;
-  renderBoard();
-  scheduleNextRefresh(nextRetryAt ? Math.max(1_000, nextRetryAt - Date.now()) : REFRESH_INTERVAL_MS);
-}
-
-async function fetchDisplay(stop, signal) {
-  const response = await fetch(`${DISPLAY_API_BASE_URL}${stop.number}`, {
-    cache: "no-store",
-    signal,
-  });
-
-  if (response.status === 429) {
-    const retryAfterHeader = response.headers.get("Retry-After");
-    const retryAfterSeconds = Number.parseInt(retryAfterHeader ?? "30", 10);
-
-    return {
-      retryAfterMs: Number.isFinite(retryAfterSeconds) ? retryAfterSeconds * 1000 : REFRESH_INTERVAL_MS,
-    };
-  }
-
-  if (!response.ok) {
-    throw new Error(`Tablica ${stop.number} odpowiedziała ${response.status}.`);
-  }
-
-  const payload = await response.json();
-  const measuredAt = payload.updated_at ? Date.parse(payload.updated_at) : Date.now();
-
-  return {
-    platform: {
-      departures: normalizeDepartures(payload.departures, measuredAt),
-      updatedAt: measuredAt,
-    },
-  };
-}
-
-function normalizeDepartures(departures, measuredAt) {
-  if (!Array.isArray(departures) || departures.length === 0) {
-    return [];
-  }
-
-  return departures
-    .map((item) => normalizeDeparture(item, measuredAt))
-    .filter(Boolean);
-}
-
-function normalizeDeparture(item, measuredAt) {
-  const lineNumber = String(item.line_number ?? "?");
-  const direction = String(item.direction ?? "Brak kierunku");
-
-  if (Number.isFinite(item.time_real)) {
-    const minutes = Math.max(0, item.time_real);
-
-    return {
-      lineNumber,
-      direction,
-      displayTime: `${minutes} min`,
-      sortMinutes: minutes,
-    };
-  }
-
-  if (typeof item.time_scheduled === "string" && item.time_scheduled) {
-    return {
-      lineNumber,
-      direction,
-      displayTime: item.time_scheduled,
-      sortMinutes: getScheduledMinutesUntil(item.time_scheduled, measuredAt),
-    };
-  }
-
-  return null;
-}
-
-function renderBoard(forceEmpty = false) {
+  elements.board.dataset.stale = payload.stale ? "true" : "false";
   elements.stopsGrid.replaceChildren();
-
-  const groups = state.stopGroups.length ? state.stopGroups : GROUP_ORDER.map((name) => ({ name, stops: [] }));
 
   for (const group of groups) {
     const sectionNode = elements.sectionTemplate.content.firstElementChild.cloneNode(true);
     sectionNode.querySelector(".stop-section__title").textContent = group.name;
 
     const rowsContainer = sectionNode.querySelector(".stop-section__rows");
-    const departures = forceEmpty ? [] : buildGroupDepartures(group);
-    const rows = buildRows(departures);
+    const rows = normalizeRows(group.rows);
 
     for (const row of rows) {
       rowsContainer.appendChild(buildRow(row));
@@ -218,31 +103,8 @@ function renderBoard(forceEmpty = false) {
   }
 }
 
-function buildGroupDepartures(group) {
-  const departures = [];
-
-  for (const stop of group.stops) {
-    const platform = state.platforms.get(stop.number);
-    if (!platform?.departures?.length) {
-      continue;
-    }
-
-    departures.push(...platform.departures);
-  }
-
-  departures.sort((left, right) => {
-    return (
-      left.sortMinutes - right.sortMinutes ||
-      left.lineNumber.localeCompare(right.lineNumber, "pl") ||
-      left.direction.localeCompare(right.direction, "pl")
-    );
-  });
-
-  return departures.slice(0, MAX_ROWS_PER_GROUP);
-}
-
-function buildRows(departures) {
-  if (!departures.length) {
+function normalizeRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
     return Array.from({ length: MAX_ROWS_PER_GROUP }, (_, index) => ({
       lineNumber: "—",
       direction: index === 0 ? "Brak odjazdów" : "",
@@ -251,13 +113,15 @@ function buildRows(departures) {
     }));
   }
 
-  const rows = departures.map((departure) => ({
-    ...departure,
-    isEmpty: false,
+  const normalized = rows.slice(0, MAX_ROWS_PER_GROUP).map((row) => ({
+    lineNumber: typeof row.lineNumber === "string" ? row.lineNumber : "—",
+    direction: typeof row.direction === "string" ? row.direction : "",
+    displayTime: typeof row.displayTime === "string" ? row.displayTime : "—",
+    isEmpty: Boolean(row.isEmpty),
   }));
 
-  while (rows.length < MAX_ROWS_PER_GROUP) {
-    rows.push({
+  while (normalized.length < MAX_ROWS_PER_GROUP) {
+    normalized.push({
       lineNumber: "—",
       direction: "",
       displayTime: "—",
@@ -265,7 +129,7 @@ function buildRows(departures) {
     });
   }
 
-  return rows;
+  return normalized;
 }
 
 function buildRow(row) {
@@ -277,21 +141,115 @@ function buildRow(row) {
   return rowNode;
 }
 
-function scheduleNextRefresh(delay) {
-  if (state.refreshTimerId) {
-    window.clearTimeout(state.refreshTimerId);
+function buildFallbackBoard() {
+  return {
+    stale: true,
+    groups: GROUP_ORDER.map((name) => ({
+      name,
+      rows: [],
+    })),
+  };
+}
+
+function validateBoardPayload(payload) {
+  if (!payload || !Array.isArray(payload.groups)) {
+    throw new Error("Invalid board payload.");
+  }
+}
+
+function saveCachedBoard(payload) {
+  try {
+    window.localStorage.setItem(BOARD_CACHE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore storage failures and keep the app rendering from memory.
+  }
+}
+
+function loadCachedBoard() {
+  try {
+    const raw = window.localStorage.getItem(BOARD_CACHE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const payload = JSON.parse(raw);
+    validateBoardPayload(payload);
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function scheduleBoardRefresh(delay) {
+  if (state.pollTimerId) {
+    window.clearTimeout(state.pollTimerId);
   }
 
-  state.refreshTimerId = window.setTimeout(() => {
-    void refreshDisplays();
+  state.pollTimerId = window.setTimeout(async () => {
+    await refreshBoard();
+    scheduleBoardRefresh(FRONTEND_REFRESH_INTERVAL_MS);
   }, delay);
+}
+
+function scheduleHardReload() {
+  if (state.hardReloadTimerId) {
+    window.clearTimeout(state.hardReloadTimerId);
+  }
+
+  state.hardReloadTimerId = window.setTimeout(() => {
+    window.location.reload();
+  }, HARD_RELOAD_INTERVAL_MS);
+}
+
+function installFrontendGuards() {
+  window.addEventListener("error", () => {
+    scheduleCrashReload();
+  });
+
+  window.addEventListener("unhandledrejection", () => {
+    scheduleCrashReload();
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      void refreshBoard();
+    }
+  });
+
+  state.watchdogTimerId = window.setInterval(() => {
+    if (!state.lastSuccessAt) {
+      return;
+    }
+
+    if (Date.now() - state.lastSuccessAt > WATCHDOG_TIMEOUT_MS) {
+      window.location.reload();
+    }
+  }, 30_000);
+}
+
+function scheduleCrashReload() {
+  window.setTimeout(() => {
+    window.location.reload();
+  }, 1_000);
+}
+
+function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) {
+    return;
+  }
+
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("./sw.js").catch(() => {
+      // Ignore registration errors; the app still works without the shell cache.
+    });
+  });
 }
 
 function startClock() {
   renderClock();
-  state.tickTimerId = window.setInterval(() => {
+  window.setInterval(() => {
     renderClock();
-  }, 1000);
+  }, 1_000);
 }
 
 function renderClock() {
@@ -300,28 +258,4 @@ function renderClock() {
     minute: "2-digit",
     second: "2-digit",
   }).format(Date.now());
-}
-
-function normalizeStopName(name) {
-  return String(name)
-    .normalize("NFD")
-    .replace(/\p{Diacritic}/gu, "");
-}
-
-function denormalizeStopName(name) {
-  return GROUP_ORDER.find((item) => normalizeStopName(item) === name) ?? name;
-}
-
-function getScheduledMinutesUntil(timeString, measuredAt) {
-  const [hourValue, minuteValue] = timeString.split(":").map((value) => Number.parseInt(value, 10));
-  const now = new Date(measuredAt);
-  const scheduled = new Date(measuredAt);
-
-  scheduled.setHours(hourValue, minuteValue, 0, 0);
-
-  if (scheduled.getTime() < now.getTime()) {
-    scheduled.setDate(scheduled.getDate() + 1);
-  }
-
-  return Math.max(0, Math.round((scheduled.getTime() - now.getTime()) / 60_000));
 }

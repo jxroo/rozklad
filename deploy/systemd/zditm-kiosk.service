@@ -1,0 +1,19 @@
+[Unit]
+Description=ZDiTM Szczecin board kiosk browser
+After=graphical.target network-online.target zditm-board.service
+Wants=network-online.target zditm-board.service
+
+[Service]
+Type=simple
+User=jamesbond
+Group=jamesbond
+WorkingDirectory=/mnt/WaltherPPK/Projekty/rozklad
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/jamesbond/.Xauthority
+ExecStart=/bin/bash /mnt/WaltherPPK/Projekty/rozklad/scripts/start-kiosk.sh http://127.0.0.1:8080/
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=graphical.target

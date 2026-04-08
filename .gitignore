@@ -1,0 +1,4 @@
+/.codex
+__pycache__/
+data/*.json
+!data/.gitkeep
