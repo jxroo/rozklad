@@ -1,4 +1,4 @@
-const CACHE_NAME = "zditm-shell-v1";
+const CACHE_NAME = "zditm-shell-v2";
 const SHELL_ASSETS = ["/", "/index.html", "/styles.css", "/app.js"];
 
 self.addEventListener("install", (event) => {
@@ -29,8 +29,15 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (event.request.mode === "navigate") {
+    // Strategia Network First dla zasobów powłoki
     event.respondWith(
-      fetch(event.request).catch(() => caches.match("/index.html"))
+      fetch(event.request).then((response) => {
+        // Jeśli sieć działa, odśwież cache i zwróć odpowiedź
+        const cloned = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, cloned));
+        return response;
+      })
+      .catch(() => caches.match(event.request)) // Jeśli brak sieci, daj z cache
     );
     return;
   }

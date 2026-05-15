@@ -1,7 +1,7 @@
 const GROUP_ORDER = ["Starkiewicza", "Osiedle Polonia", "Dunikowskiego", "Plac Szyrockiego"];
 const BOARD_API_URL = "/api/board";
 const BOARD_CACHE_KEY = "zditm-board-cache-v1";
-const MAX_ROWS_PER_GROUP = 10;
+const MAX_ROWS_PER_GROUP = 7;
 const FRONTEND_REFRESH_INTERVAL_MS = 15_000;
 const WATCHDOG_TIMEOUT_MS = 180_000;
 const HARD_RELOAD_INTERVAL_MS = 6 * 60 * 60 * 1000;
