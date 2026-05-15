@@ -1,4 +1,4 @@
-const CACHE_NAME = "zditm-shell-v2";
+const CACHE_NAME = "zditm-shell-v3";
 const SHELL_ASSETS = ["/", "/index.html", "/styles.css", "/app.js"];
 
 self.addEventListener("install", (event) => {
